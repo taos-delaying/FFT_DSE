@@ -1,0 +1,8 @@
+# 通用
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+*.swp
+.vscode/
+.idea/

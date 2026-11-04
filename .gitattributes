@@ -1,0 +1,26 @@
+# 统一换行符为 LF
+* text=auto eol=lf
+
+# 源码类
+*.v    text eol=lf
+*.sv   text eol=lf
+*.vh   text eol=lf
+*.vhd  text eol=lf
+*.xdc  text eol=lf
+*.xpr  text eol=lf
+*.tcl  text eol=lf
+*.do   text eol=lf
+*.py   text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+
+# 二进制文件，禁止任何转换
+*.bit  binary
+*.bin  binary
+*.dcp  binary
+*.ltx  binary
+*.hdf  binary
+*.xsa  binary
+*.pdf  binary
+*.png  binary
+*.jpg  binary
