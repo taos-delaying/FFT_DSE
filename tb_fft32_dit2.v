@@ -1,18 +1,18 @@
 `timescale 1ns / 1ps
 
-// Behavioral testbench for the EXISTING fft32_dit2 interface.
-// Verilog-2001; add to Simulation Sources only.
-// Vivado 2017.4 Simulation Settings -> Elaboration -> xelab.more_options:
-// --timescale 1ns/1ps (the existing RTL modules have no timescale directive).
-// Five register levels: a frame captured at edge 1 appears after edge 5.
-// The reference uses iterative radix-2 DIT, not the DUT hierarchy/functions.
-// Arithmetic contract: Q15, forward FFT, no normalization, per-stage
-// saturation, and arithmetic truncation after each complex multiplication.
+// Behavioral testbench for fft32_dit2. Add to Simulation Sources only.
+// Use xelab --timescale 1ns/1ps with Vivado 2017.4.
+// A batch run must contain the final "PASS: all" line; xsim's exit code alone
+// may be zero even when the testbench reports a fatal error.
+// Four register levels: a frame sampled at edge 1 appears after edge 4.
+// Iterative DIT reference: Q1.15 forward FFT/32, radix-4 base (/4), then
+// three radix-2 stages (/2 each). Retain the whole complex product through
+// the butterfly addition/subtraction, then truncate and saturate to Q1.15.
 
 module tb_fft32_dit2;
     localparam integer N = 32;
-    localparam integer LATENCY = 5;
-    localparam integer NUM_FRAMES = 26;
+    localparam integer LATENCY = 4;
+    localparam integer NUM_FRAMES = 28;
     localparam real PI = 3.14159265358979323846;
 
     reg clk;
@@ -212,6 +212,14 @@ module tb_fft32_dit2;
         end
     endfunction
 
+    // Numerators have 30 fractional bits. Shift 15 for Q1.15 and 1 for /2.
+    function signed [15:0] scaled_radix2;
+        input signed [63:0] numerator;
+        begin
+            scaled_radix2 = saturate16(numerator >>> 16);
+        end
+    endfunction
+
     task calculate_reference;
         input integer id;
         integer n;
@@ -223,7 +231,7 @@ module tb_fft32_dit2;
         integer odd_index;
         integer ar, ai, br, bi;
         integer wr, wi;
-        integer tr, ti;
+        reg signed [63:0] even_r_q30, even_i_q30;
         reg signed [63:0] product_r;
         reg signed [63:0] product_i;
         real angle;
@@ -244,28 +252,50 @@ module tb_fft32_dit2;
                         br = ref_real[odd_index];
                         bi = ref_imag[odd_index];
 
-                        if (j == 0) begin
-                            tr = br;
-                            ti = bi;
-                        end else if (4*j == span) begin
-                            // Keep +32768 here if br == -32768.
-                            // The DUT saturates only AFTER A +/- (-j*B).
-                            tr = bi;
-                            ti = -br;
+                        if (span == 2) begin
+                            // First half of one radix-4 transform: keep the
+                            // full sums/differences until the span=4 step.
+                            ref_real[even_index] = ar + br;
+                            ref_imag[even_index] = ai + bi;
+                            ref_real[odd_index]  = ar - br;
+                            ref_imag[odd_index]  = ai - bi;
+                        end else if (span == 4) begin
+                            // Complete the radix-4 stage, one truncation only.
+                            if (j == 1) begin
+                                // Exact -j rotation. Keep the signed guard bits.
+                                product_r = bi;
+                                product_i = -br;
+                            end else begin
+                                product_r = br;
+                                product_i = bi;
+                            end
+                            ref_real[even_index] = (ar + product_r) >>> 2;
+                            ref_imag[even_index] = (ai + product_i) >>> 2;
+                            ref_real[odd_index]  = (ar - product_r) >>> 2;
+                            ref_imag[odd_index]  = (ai - product_i) >>> 2;
                         end else begin
-                            angle = 2.0 * PI * j / span;
-                            wr = coefficient_q15($cos(angle));
-                            wi = coefficient_q15(-$sin(angle));
+                            // Coefficients remain wide in the reference. This
+                            // permits +1 (=32768) in the W=1 and -j shortcuts.
+                            if (j == 0) begin
+                                wr = 32768;
+                                wi = 0;
+                            end else if (4*j == span) begin
+                                wr = 0;
+                                wi = -32768;
+                            end else begin
+                                angle = 2.0 * PI * j / span;
+                                wr = coefficient_q15($cos(angle));
+                                wi = coefficient_q15(-$sin(angle));
+                            end
+                            even_r_q30 = ar * 64'sd32768;
+                            even_i_q30 = ai * 64'sd32768;
                             product_r = br * wr - bi * wi;
                             product_i = br * wi + bi * wr;
-                            tr = saturate16(product_r >>> 15);
-                            ti = saturate16(product_i >>> 15);
+                            ref_real[even_index] = scaled_radix2(even_r_q30 + product_r);
+                            ref_imag[even_index] = scaled_radix2(even_i_q30 + product_i);
+                            ref_real[odd_index]  = scaled_radix2(even_r_q30 - product_r);
+                            ref_imag[odd_index]  = scaled_radix2(even_i_q30 - product_i);
                         end
-
-                        ref_real[even_index] = saturate16(ar + tr);
-                        ref_imag[even_index] = saturate16(ai + ti);
-                        ref_real[odd_index] = saturate16(ar - tr);
-                        ref_imag[odd_index] = saturate16(ai - ti);
                     end
                 end
             end
@@ -287,11 +317,12 @@ module tb_fft32_dit2;
         end
     endtask
 
-    // Frames 0..9 are directed; 10..17 are small random complex inputs;
-    // 18..25 are full-range random complex inputs exercising saturation.
+    // Frames 0..9 are directed, 10..17 small random and 18..25 full-range
+    // random. Frames 26/27 force opposite saturation directions in bin 4.
     task prepare_frame;
         input integer id;
         integer n;
+        integer amplitude;
         begin
             clear_inputs;
             case (id)
@@ -336,6 +367,21 @@ module tb_fft32_dit2;
                     x_real[3] = 16'sh8000;
                     x_imag[3] = 16'sh8000;
                 end
+                26, 27: begin
+                    // Both 16-point child FFTs produce A+jA in bin 4:
+                    // each sees a quarter-turn tone (A+jA)*j**m. The top
+                    // W=(23170-j23170)/32768 rotates the odd child's bin.
+                    // Before limiting, the scaled real code is +39552/-39553.
+                    amplitude = (id == 26) ? 32767 : -32767;
+                    for (n = 0; n < N; n = n + 1) begin
+                        case ((n / 2) % 4)
+                            0: begin x_real[n] =  amplitude; x_imag[n] =  amplitude; end
+                            1: begin x_real[n] = -amplitude; x_imag[n] =  amplitude; end
+                            2: begin x_real[n] = -amplitude; x_imag[n] = -amplitude; end
+                            3: begin x_real[n] =  amplitude; x_imag[n] = -amplitude; end
+                        endcase
+                    end
+                end
                 default: begin
                     for (n = 0; n < N; n = n + 1) begin
                         if (id < 18) begin
@@ -348,6 +394,21 @@ module tb_fft32_dit2;
                     end
                 end
             endcase
+        end
+    endtask
+
+    // Closed-form outputs provide independent checks of normalization and
+    // clipping, in addition to the bit-exact reference used for every bin.
+    task check_analytic_bin;
+        input integer k;
+        input signed [15:0] want_real, want_imag;
+        begin
+            if ((y_real[k] !== want_real) || (y_imag[k] !== want_imag)) begin
+                if (errors < 16)
+                    $display("FAIL analytic frame=%0d bin=%0d got=(%0d,%0d) expected=(%0d,%0d)",
+                        result_id, k, $signed(y_real[k]), $signed(y_imag[k]), want_real, want_imag);
+                errors = errors + 1;
+            end
         end
     endtask
 
@@ -387,6 +448,17 @@ module tb_fft32_dit2;
                     errors = errors + 1;
                 end
             end
+            case (result_id)
+                1: for (bin = 0; bin < N; bin = bin + 1)
+                       check_analytic_bin(bin, 16'sd256, -16'sd128);
+                2: begin
+                    check_analytic_bin(0, 16'sd128, -16'sd64);
+                    for (bin = 1; bin < N; bin = bin + 1)
+                        check_analytic_bin(bin, 16'sd0, 16'sd0);
+                end
+                26: check_analytic_bin(4, 16'sh7fff, 16'sd16383);
+                27: check_analytic_bin(4, 16'sh8000, -16'sd16384);
+            endcase
             checked = checked + 1;
             if (errors == errors_before)
                 $display("PASS frame=%0d at %0t", result_id, $time);
@@ -427,16 +499,16 @@ module tb_fft32_dit2;
             errors = errors + 1;
         end
 
-        if (errors == 0)
-            $display("PASS: all %0d frames matched the Q15 reference; reset and 5-stage latency checked.", checked);
-        else
-            $display("FAIL: %0d mismatches/errors; checked %0d of %0d frames.", errors, checked, submitted);
-        $finish;
+        if (errors == 0) begin
+            $display("PASS: all %0d frames matched FFT/32; reset, four-stage latency and saturation checked.", checked);
+            $finish;
+        end else begin
+            $fatal(1, "FAIL: %0d errors; checked %0d of %0d frames.", errors, checked, submitted);
+        end
     end
 
     initial begin
         #5000;
-        $display("FAIL: simulation timeout");
-        $finish;
+        $fatal(1, "FAIL: simulation timeout");
     end
 endmodule

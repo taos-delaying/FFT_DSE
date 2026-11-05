@@ -1,4 +1,4 @@
-module fft4_dit4(
+module fft4_dit4(//输出结果为1/4的FFT结果
     input clk,
     input rst_n,
     input signed [15:0] data0_in_real,
@@ -49,14 +49,14 @@ always @(posedge clk)
         data3_out_real <= 16'd0;
         data3_out_imag <= 16'd0;
     end else begin
-        data0_out_real <= sum18_to_w16(data0_out_real_wire);
-        data0_out_imag <= sum18_to_w16(data0_out_imag_wire);
-        data1_out_real <= sum18_to_w16(data1_out_real_wire);
-        data1_out_imag <= sum18_to_w16(data1_out_imag_wire);
-        data2_out_real <= sum18_to_w16(data2_out_real_wire);
-        data2_out_imag <= sum18_to_w16(data2_out_imag_wire);
-        data3_out_real <= sum18_to_w16(data3_out_real_wire);
-        data3_out_imag <= sum18_to_w16(data3_out_imag_wire);
+        data0_out_real <= sum18_to_w16_div4(data0_out_real_wire);
+        data0_out_imag <= sum18_to_w16_div4(data0_out_imag_wire);
+        data1_out_real <= sum18_to_w16_div4(data1_out_real_wire);
+        data1_out_imag <= sum18_to_w16_div4(data1_out_imag_wire);
+        data2_out_real <= sum18_to_w16_div4(data2_out_real_wire);
+        data2_out_imag <= sum18_to_w16_div4(data2_out_imag_wire);
+        data3_out_real <= sum18_to_w16_div4(data3_out_real_wire);
+        data3_out_imag <= sum18_to_w16_div4(data3_out_imag_wire);
     end
 
 endmodule
