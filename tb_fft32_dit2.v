@@ -1,6 +1,7 @@
 `timescale 1ns / 1ps
 
-// Behavioral testbench for fft32_dit2. Add to Simulation Sources only.
+// Functional and post-implementation timing testbench for fft32_dit2.
+// Add to Simulation Sources only.
 // Use xelab --timescale 1ns/1ps with Vivado 2017.4.
 // A batch run must contain the final "PASS: all" line; xsim's exit code alone
 // may be zero even when the testbench reports a fatal error.
@@ -12,7 +13,12 @@
 module tb_fft32_dit2;
     localparam integer N = 32;
     localparam integer LATENCY = 4;
-    localparam integer NUM_FRAMES = 28;
+    localparam integer PICO_FRAME = 28;       // IDs 0..27 are the regression.
+    localparam integer NUM_FRAMES = PICO_FRAME + 1;
+    localparam real CLK_PERIOD_NS = 10.0;
+    localparam real INPUT_DELAY_NS = 1.0;    // E0 to input, XDC range 0.141..2 ns
+    localparam real CHECK_DELAY_NS = CLK_PERIOD_NS - 0.001;
+    localparam real GSR_WAIT_NS = 120.0;     // past the default 100 ns glbl.GSR
     localparam real PI = 3.14159265358979323846;
 
     reg clk;
@@ -38,6 +44,30 @@ module tb_fft32_dit2;
     integer bin;
     integer result_id;
     integer errors_before;
+
+    // Bin 0 is the least significant word; each word is {imag, real}.
+    wire [32*N-1:0] outputs;
+    localparam [32*N-1:0] LEAD_IN_SPECTRUM = {N{32'hff80_0100}};
+    localparam [32*N-1:0] PICO_SPECTRUM = 32'h0000_4000;
+    reg pico_watch;
+    realtime pico_e0_ns, pico_e4_ns, pico_e5_ns;
+    realtime pico_last_change_ns, pico_latency_ns;
+    genvar k_out;
+    generate
+        for (k_out = 0; k_out < N; k_out = k_out + 1) begin: pack_bin
+            assign outputs[32*k_out +: 32] = {y_imag[k_out], y_real[k_out]};
+        end
+    endgenerate
+
+    // Record every port transition (also X/Z and glitches). If the final bus
+    // is correct, its last transition is the start of the verified stable span.
+    always @(outputs) begin
+        if (pico_watch) begin
+            if ($realtime < pico_e0_ns + LATENCY*CLK_PERIOD_NS)
+                $fatal(1, "FAIL: output changed before E4 at %0.3f ns", $realtime);
+            pico_last_change_ns = $realtime;
+        end
+    end
 
     fft32_dit2 dut (
         .clk(clk),
@@ -173,7 +203,7 @@ module tb_fft32_dit2;
     );
 
     // The XDC does NOT generate this simulation clock.
-    always #5 clk = ~clk;
+    always #(CLK_PERIOD_NS / 2.0) clk = ~clk;
 
     function integer reverse5;
         input integer value;
@@ -367,6 +397,11 @@ module tb_fft32_dit2;
                     x_real[3] = 16'sh8000;
                     x_imag[3] = 16'sh8000;
                 end
+                PICO_FRAME: begin
+                    // Match the PicoRV32 firmware: 32 copies of 0.5 + j0.
+                    for (n = 0; n < N; n = n + 1)
+                        x_real[n] = 16'sd16384;
+                end
                 26, 27: begin
                     // Both 16-point child FFTs produce A+jA in bin 4:
                     // each sees a quarter-turn tone (A+jA)*j**m. The top
@@ -413,7 +448,8 @@ module tb_fft32_dit2;
     endtask
 
     // Shift tags at the same edges that capture DUT inputs.
-    // Wait 1 ns before checking, so nonblocking output updates have settled.
+    // Check 1 ps before the next rising edge. This is a correctness check;
+    // the independent output transition timestamp is used for latency.
     always @(posedge clk) begin
         if (!rst_n) begin
             for (p = 0; p < LATENCY; p = p + 1)
@@ -424,8 +460,8 @@ module tb_fft32_dit2;
             frame_pipe[0] = drive_id;
         end
 
-        #1;
-        if (!rst_n) begin
+        #(CHECK_DELAY_NS);
+        if (!rst_n && $realtime >= GSR_WAIT_NS) begin
             for (bin = 0; bin < N; bin = bin + 1) begin
                 if ((y_real[bin] !== 16'sd0) ||
                     (y_imag[bin] !== 16'sd0)) begin
@@ -465,6 +501,47 @@ module tb_fft32_dit2;
         end
     end
 
+    task measure_pico_frame;
+        begin
+            // Hold the impulse from frame 1 until the pipeline is full. All
+            // 32 bins are (256,-128); every component differs from the target.
+            @(posedge clk);
+            #(INPUT_DELAY_NS);
+            drive_id = -1;
+            prepare_frame(1);
+            repeat (LATENCY + 1) @(posedge clk);
+            if (outputs !== LEAD_IN_SPECTRUM)
+                $fatal(1, "FAIL: incorrect lead-in spectrum at E0");
+
+            // This rising edge is the upstream launch edge E0. Drive the DUT
+            // after the modeled input delay; it first samples this frame at E1.
+            pico_e0_ns = $realtime;
+            pico_last_change_ns = -1.0;
+            pico_watch = 1'b1;
+            #(INPUT_DELAY_NS);
+            prepare_frame(PICO_FRAME);
+            calculate_reference(PICO_FRAME);
+            drive_id = PICO_FRAME;
+            submitted = submitted + 1;
+
+            @(posedge clk);                       // E1
+            #(INPUT_DELAY_NS);
+            drive_id = -1;                        // hold target data on the ports
+            repeat (LATENCY - 1) @(posedge clk);  // E4
+            pico_e4_ns = $realtime;
+            @(posedge clk);                       // E5: next consumer sampling edge
+            pico_e5_ns = $realtime;
+            @(posedge clk);                       // E6: one extra stability interval
+            @(negedge clk);                       // past E6 netlist updates
+            pico_watch = 1'b0;
+            if (outputs !== PICO_SPECTRUM ||
+                pico_last_change_ns < pico_e4_ns || pico_last_change_ns >= pico_e5_ns)
+                $fatal(1, "FAIL: target must settle in [E4,E5) and stay correct through E6; E4=%0.3f E5=%0.3f last_change=%0.3f ns",
+                       pico_e4_ns, pico_e5_ns, pico_last_change_ns);
+            pico_latency_ns = pico_last_change_ns - pico_e0_ns;
+        end
+    endtask
+
     initial begin
         clk = 1'b0;
         rst_n = 1'b0;
@@ -473,26 +550,26 @@ module tb_fft32_dit2;
         checked = 0;
         errors = 0;
         seed = 32'h13579bdf;
+        pico_watch = 1'b0;
         clear_inputs;
 
-        // Synchronous reset must span rising clock edges.
-        repeat (3) @(negedge clk);
+        // Keep the DUT reset during FPGA global reset and clock it afterwards.
+        #(GSR_WAIT_NS);
+        repeat (3) @(posedge clk);
+        #(INPUT_DELAY_NS);
         rst_n = 1'b1;
 
-        // Drive on falling edges to avoid racing the DUT's rising edges.
-        // All 32 complex samples of one frame arrive together each cycle.
-        for (frame = 0; frame < NUM_FRAMES; frame = frame + 1) begin
-            @(negedge clk);
+        // Launch complete frames on consecutive edges with modeled source delay.
+        for (frame = 0; frame < PICO_FRAME; frame = frame + 1) begin
+            @(posedge clk);
+            #(INPUT_DELAY_NS);
             prepare_frame(frame);
             calculate_reference(frame);
             drive_id = frame;
             submitted = submitted + 1;
         end
 
-        @(negedge clk);
-        drive_id = -1;
-        clear_inputs;
-        repeat (LATENCY+1) @(negedge clk);
+        measure_pico_frame;
 
         if (checked != submitted) begin
             $display("FAIL frame count: submitted=%0d checked=%0d", submitted, checked);
@@ -500,6 +577,8 @@ module tb_fft32_dit2;
         end
 
         if (errors == 0) begin
+            $display("FFT32_PICO_LATENCY E0_ns=%0.3f E4_ns=%0.3f stable_ns=%0.3f elapsed_ns=%0.3f",
+                     pico_e0_ns, pico_e4_ns, pico_last_change_ns, pico_latency_ns);
             $display("PASS: all %0d frames matched FFT/32; reset, four-stage latency and saturation checked.", checked);
             $finish;
         end else begin
